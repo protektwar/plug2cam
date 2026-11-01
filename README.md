@@ -11,6 +11,7 @@ The protocol was reverse-engineered from packet captures and the Plug2View Andro
 - **Camera window:** click a tile to open the camera in its own window, with:
   - fullscreen (F11 or double-click);
   - snapshot (S);
+  - sound from the camera's microphone (**Sound**, or M), with a volume slider;
   - recording of every frame as a JPEG;
   - live stats: resolution, fps, frame size, dropped frames, reconnects.
 - **Remembered cameras:** cameras are saved and reconnected at the next start, even when broadcasts don't reach them.
@@ -34,6 +35,7 @@ The protocol was reverse-engineered from packet captures and the Plug2View Andro
 
 - Python 3.8+
 - PyQt6 (or PyQt5)
+- For sound: `pacat` (PulseAudio/PipeWire), `pw-cat` or `aplay`. Without one, the Sound button stays disabled.
 
 `camb_gui.py` is a single self-contained file, with the camera protocol built in.
 
@@ -56,7 +58,9 @@ python3 camb_gui.py --scan 30                # seconds between LAN searches (def
 |---|---|
 | Main window | Click a tile to open the camera; right-click a tile for Wi-Fi… and Remove camera… |
 | Toolbar | **Scan now**, **Camera list** |
-| Camera window | **Settings…** (video quality), **WiFi…**, **Record frames**, **Snapshot**, **Fullscreen** |
+| Camera window | **Sound** (M) + volume, **Settings…** (video quality), **WiFi…**, **Record frames**, **Snapshot**, **Fullscreen** |
+
+Sound plays for one camera at a time. Turning it on for another camera turns it off for the first, and closing the window turns it off.
 
 Saved cameras live in `~/.config/camb_gui/cameras.json`, or under `$XDG_CONFIG_HOME` if that is set.
 
@@ -98,6 +102,9 @@ Resolution codes (`enc`): 3 = 320×240, 5 = 640×480, 9 = 1280×720. The frame r
 | Control packets | `00 00 [(len<<4) u16][2B][00][(len-4) u16] d1 07 00 00` + bencode XOR `0xE9` |
 | Data packets | `[seq u16][(len<<4) u16] 32 01 00 [(len-4) u16][code u16] 00 00` + text (2 bytes plain, rest XOR `0xE9`) |
 | Video session | `HK_RES_REQ` → `SessionCreate` → `SessionStart` → MJPEG frames → `SessionDelete` |
+| Audio session | A second session on the same connection: `HK_RES_REQ` with `ftN0=audio.vbAudio.Out;ftN1=net.0;ftN2=HKPCAudioPlay.HKPCAudioPlay`, then `SessionStart` with `ftN0=HKPCAudioPlay.HKPCAudioPlay` |
+| Stream framing | Video and audio share one packet sequence. The low 4 bits of the length word name the stream channel. Each frame starts at a packet boundary with a 9-byte header `[type][00 00][frame length u16 LE, header included][xx][04 00 00]`. Type `0x46` = audio, `0x4a`/`0x4e` = video (JPEG at body offset 2). |
+| Audio format | 8 kHz mono 16-bit little-endian PCM on MJPEG models (`userType` 311/312), 3072 samples (0.384 s) per frame. Other models use G.711 or G.726, according to the app. |
 | Read settings | `MainCmd=800` |
 | Set video | `MainCmd=801;SubCmd=803;stream=…;enc=…;rate=…;` |
 | LAN search | UDP 2627 (client port 2726); `MainCmd=LocalData` |
@@ -119,6 +126,7 @@ The GUI's Wi-Fi packets are byte-identical to the official app's, apart from 3 r
 - 1280×720 (`enc=9`), 30 fps, and the allowed custom-bitrate range.
 - The format of the Wi-Fi scan reply, which was inferred from the app's native library. If the scan list stays empty, type the network name instead.
 - Reading the current Wi-Fi settings is not implemented. The dialog fills in only the network name the camera reports in its LAN-search reply.
+- Sound was verified on a `userType` 312 camera (PCM). G.711 cameras are decoded on a best-effort basis (A-law, through `audioop`, Python ≤ 3.12). G.726/G.729 models are not supported; the Sound button is disabled for them.
 
 ## Files
 

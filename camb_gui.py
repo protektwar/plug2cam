@@ -14,6 +14,13 @@ Click a tile to open that camera in its own window (double-click / F11 = fullscr
 """
 import argparse, json, os, random, re, select, socket, string, sys, threading, time
 from collections import OrderedDict, deque
+try:
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning); import audioop    # G.711 decoding (removed in 3.13)
+    _HAVE_AUDIOOP = True
+except ImportError:
+    _HAVE_AUDIOOP = False
 
 try:
     from PyQt6.QtCore import Qt, QTimer, QRectF, QObject, pyqtSignal
@@ -22,7 +29,7 @@ try:
                                  QScrollArea, QLabel, QPushButton, QFileDialog, QToolBar, QFrame,
                                  QDialog, QFormLayout, QComboBox, QSpinBox, QDialogButtonBox, QMenu,
                                  QLineEdit, QCheckBox, QMessageBox, QDockWidget, QTableWidget,
-                                 QTableWidgetItem, QHeaderView, QAbstractItemView, QInputDialog)
+                                 QTableWidgetItem, QHeaderView, QAbstractItemView, QInputDialog, QSlider)
 except ImportError:
     from PyQt5.QtCore import Qt, QTimer, QRectF, QObject, pyqtSignal
     from PyQt5.QtGui import QImage, QPainter, QColor, QFont, QKeySequence
@@ -30,7 +37,7 @@ except ImportError:
                                  QScrollArea, QLabel, QPushButton, QFileDialog, QToolBar, QFrame, QShortcut, QAction,
                                  QDialog, QFormLayout, QComboBox, QSpinBox, QDialogButtonBox, QMenu,
                                  QLineEdit, QCheckBox, QMessageBox, QDockWidget, QTableWidget,
-                                 QTableWidgetItem, QHeaderView, QAbstractItemView, QInputDialog)
+                                 QTableWidgetItem, QHeaderView, QAbstractItemView, QInputDialog, QSlider)
 
 # ------------------------------------------------------------------ camera protocol (from camb6.py)
 # UDP 5000 <-> 5000, LAN search on UDP 2627; see README.md for the packet formats
@@ -177,6 +184,11 @@ class Cam:
         self.cid, self.clo = new_conn(); self.hello_reply = None
         self.replies = []          # text replies (config mode)
         self.acked = set()         # our data seqs the camera acknowledged
+        self.chan = {}             # stream channel (low nibble of the length word) -> [frame bytes, frame length]
+        self.framed = set()        # channels that carry framed data (9-byte headers)
+        self.want_audio = False; self.audio_sid = None; self.audio_started = False
+        self.audio_req_at = 0; self.audio_tries = 0; self.audio_frames = 0
+        self.on_audio = None       # callback(devid, frame body) for audio frames
         if save: os.makedirs(save, exist_ok=True)
 
     # -- send helpers
@@ -202,9 +214,28 @@ class Cam:
                        f"FD0=9;ftN1=net.{fd};FD1={fd};", 100)
         self.started = True
         print(f"[{self.devid}] session started")
+        if self.want_audio: self.request_audio()
 
     def stop(self):
+        self.stop_audio()
         if self.sid: self.send_data(f"sidN={self.sid};MainCmd=SessionDelete;coz=;", 100)
+
+    # -- audio session (camera microphone): a second session on the same connection, like the app's "listen"
+    def request_audio(self):
+        self.audio_sid = f"{rnd(5)}.{random.getrandbits(32):08x}"; self.audio_started = False
+        self.send_data(f"id=11;ftN0=audio.vbAudio.Out;ftN1=net.0;ftN2=HKPCAudioPlay.HKPCAudioPlay;"
+                       f"opN2={self.audio_sid};sidN={self.audio_sid};AsCode=337;MainCmd=HK_RES_REQ;user=Lan user;", 337)
+        self.audio_req_at = time.time(); self.audio_tries += 1
+
+    def start_audio(self, fd):
+        self.send_data(f"MainCmd=SessionStart;sidN={self.audio_sid};ftN0=HKPCAudioPlay.HKPCAudioPlay;"
+                       f"FD0=9;ftN1=net.{fd};FD1={fd};", 100)
+        self.audio_started = True
+        print(f"[{self.devid}] audio started")
+
+    def stop_audio(self):
+        if self.audio_sid: self.send_data(f"sidN={self.audio_sid};MainCmd=SessionDelete;coz=;", 100)
+        self.audio_sid = None; self.audio_started = False; self.audio_tries = 0
 
     def open(self):
         self.hello(); time.sleep(0.3); self.request()
@@ -219,6 +250,9 @@ class Cam:
             else:
                 print(f"[{self.devid}] no SessionCreate yet, asking again")
             self.request()
+        if (self.want_audio and self.started and not self.audio_started and self.audio_tries < 5
+                and now - self.audio_req_at > 3):
+            self.request_audio()                # no SessionCreate for the audio yet (or never asked)
         if now >= self.next_guard:
             self.guard += 1; self.send_ctl(OrderedDict(ICMD=29, SEQ=self.guard + 1, GUARDSEQ=self.guard), b45=(0x10, 0x00))
             self.next_guard = now + 1.5
@@ -250,7 +284,9 @@ class Cam:
             if d is not None:
                 self.replies.append(d)
                 self.send_ctl(OrderedDict(ICMD=1, SEQ=seq, TIME=0))      # ack replies right away
-                if d.get("MainCmd") == "SessionCreate" and not self.started and d.get("sidN") in self.sids:
+                if d.get("MainCmd") == "SessionCreate" and self.audio_sid and d.get("sidN") == self.audio_sid:
+                    if not self.audio_started: self.start_audio(d.get("FD0", "1025"))   # the camera may repeat it
+                elif d.get("MainCmd") == "SessionCreate" and not self.started and d.get("sidN") in self.sids:
                     self.sid = d["sidN"]; self.start_session(d.get("FD0", "1025"))
                 elif d.get("MainCmd") != "SessionCreate" or self.verbose:
                     print(f"[{self.devid}] << {dict(mask(d))}")
@@ -258,7 +294,7 @@ class Cam:
         if not self.started: return
         if self.nxt is None: self.nxt = seq; self.ack = seq
         if ((seq - self.nxt) & 0xFFFF) > 0x8000: return
-        self.pkts[seq] = pl[4:]
+        self.pkts[seq] = (pl[2] & 15, pl[4:])            # (stream channel, payload)
         self.consume()
         while all(((self.ack + k) & 0xFFFF) in self.pkts or ((self.ack + k - self.nxt) & 0xFFFF) > 0x8000
                   for k in range(5)):
@@ -268,14 +304,14 @@ class Cam:
     def consume(self):
         while self.nxt is not None:
             if self.nxt in self.pkts:
-                self.feed(self.pkts.pop(self.nxt)); self.nxt = (self.nxt + 1) & 0xFFFF; self.gap_since = None
+                self.feed(*self.pkts.pop(self.nxt)); self.nxt = (self.nxt + 1) & 0xFFFF; self.gap_since = None
                 continue
             if not self.pkts: return
             ahead = max(((s - self.nxt) & 0xFFFF) for s in self.pkts)
             if self.gap_since is None:
                 self.gap_since = time.time(); self.request_resend(ahead)
             if ahead > 30 or time.time() - self.gap_since > 0.3:
-                self.lost += 1; self.in_frame = False; self.buf.clear()
+                self.lost += 1; self.in_frame = False; self.buf.clear(); self.chan.clear()
                 self.nxt = (self.nxt + 1) & 0xFFFF; self.gap_since = None
                 continue
             return
@@ -287,7 +323,52 @@ class Cam:
         for i, m in enumerate(missing): d[f"LostSEQ_{i}"] = m
         d["Count"] = len(missing); self.send_ctl(d)
 
-    def feed(self, data):
+    # Video and audio share one packet sequence; the low nibble of the length word names the stream
+    # channel. Every frame starts at a packet boundary with a 9-byte header:
+    #   [type][00 00][frame length u16 LE, header included][xx][04 00 00]
+    # type 0x46 = audio (16-bit LE PCM, 8 kHz mono on MJPEG models), 0x4a/0x4e = video (JPEG at body offset 2).
+    @staticmethod
+    def is_frame_header(d):
+        return len(d) >= 9 and d[1:3] == b"\0\0" and d[6:9] == b"\x04\0\0" and 9 < int.from_bytes(d[3:5], "little") < 1 << 16
+
+    def feed(self, ch, data):
+        if self.is_frame_header(data):
+            if not self.framed: self.in_frame = False; self.buf.clear()   # framed camera: drop marker-search state
+            self.framed.add(ch)                          # a cut-off frame before this one is dropped
+            self.chan[ch] = [bytearray(data), int.from_bytes(data[3:5], "little")]
+        elif ch in self.chan:
+            self.chan[ch][0] += data
+        elif not self.framed:
+            return self.feed_markers(data)               # camera without frame headers: find JPEGs by marker
+        else:
+            return                                       # rest of a frame whose start was lost (or audio
+                                                         # joined mid-frame; its samples can look like JPEG markers)
+        buf, need = self.chan[ch]
+        if len(buf) >= need:
+            del self.chan[ch]
+            if len(buf) == need: self.on_frame(bytes(buf))
+
+    def on_frame(self, f):
+        body = f[9:]
+        if f[0] & 0x0C == 0x04:                          # audio frame (samples may contain JPEG-like bytes)
+            self.audio_frames += 1
+            if self.on_audio: self.on_audio(self.devid, body)
+            return
+        a = body.find(b"\xff\xd8\xff", 0, 32)
+        if a >= 0:
+            e = body.rfind(b"\xff\xd9")
+            if e > a: self.got_jpeg(body[a:e + 2])
+
+    JPEG_FIRST_MARKERS = {0xDB, 0xC0, 0xC2, 0xC4, 0xDD, 0xFE} | set(range(0xE0, 0xF0))
+
+    def got_jpeg(self, jpg):
+        if len(jpg) < 64 or jpg[3] not in self.JPEG_FIRST_MARKERS or not jpeg_size(jpg):
+            return                                       # not a real JPEG (e.g. audio bytes that look like markers)
+        self.nframes += 1; self.frames.put(jpg)
+        if self.save:
+            with open(os.path.join(self.save, f"{self.devid}_{self.nframes:06d}.jpg"), "wb") as f: f.write(jpg)
+
+    def feed_markers(self, data):
         a = data.find(b"\xff\xd8\xff")
         if a >= 0: self.buf = bytearray(data[a:]); self.in_frame = True
         elif self.in_frame: self.buf += data
@@ -295,9 +376,7 @@ class Cam:
             e = self.buf.find(b"\xff\xd9")
             if e >= 0:
                 jpg = bytes(self.buf[:e+2]); self.in_frame = False; self.buf.clear()
-                self.nframes += 1; self.frames.put(jpg)
-                if self.save:
-                    with open(os.path.join(self.save, f"{self.devid}_{self.nframes:06d}.jpg"), "wb") as f: f.write(jpg)
+                self.got_jpeg(jpg)
 
 # ------------------------------------------------------------------ hub (one UDP socket, many cameras)
 class Hub:
@@ -344,6 +423,69 @@ def parse_lan_reply(pl):
             if "_raw" not in d: return d
     d = kv(lan_text(pl))
     return d or None
+
+
+# audio codec by the camera's LAN-search userType (mapping from the Plug2View app; only PCM verified on a camera)
+AUDIO_CODECS = {**{t: "PCM" for t in ("311", "312", "313", "331", "332", "381", "382")},
+                **{t: "G711" for t in ("322", "323")}, **{t: "G726" for t in ("321", "351", "352", "H264")}}
+
+
+class AudioPlayer:
+    """plays 8 kHz mono 16-bit PCM through the desktop sound server (pacat / pw-cat / aplay on stdin)"""
+    COMMANDS = [["pacat", "--raw", "--format=s16le", "--rate=8000", "--channels=1", "--latency-msec=250",
+                 "--client-name=camb_gui", "--stream-name=camera"],
+                ["pw-cat", "--playback", "--format", "s16", "--rate", "8000", "--channels", "1", "-"],
+                ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "8000", "-c", "1"]]
+    MAX_QUEUED = 6                                  # frames (0.38 s each); older ones are dropped to keep delay low
+
+    def __init__(self):
+        import shutil
+        self.cmd = next((c for c in self.COMMANDS if shutil.which(c[0])), None)
+        self.proc = None; self.queue = deque(); self.cv = threading.Condition()
+        self.gain = 2.0                             # the camera microphones are quiet (about -38 dBFS in a quiet room)
+
+    def available(self): return self.cmd is not None
+
+    def start(self):
+        if self.proc or not self.cmd: return
+        import subprocess
+        self.proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        threading.Thread(target=self._writer, args=(self.proc,), daemon=True).start()
+
+    def stop(self):
+        p, self.proc = self.proc, None
+        with self.cv: self.queue.clear(); self.cv.notify_all()
+        if p:
+            try: p.stdin.close()
+            except OSError: pass
+            p.terminate()
+
+    def feed(self, pcm):
+        """called from the network thread: never blocks"""
+        if not self.proc: return
+        with self.cv:
+            self.queue.append(pcm)
+            while len(self.queue) > self.MAX_QUEUED: self.queue.popleft()
+            self.cv.notify()
+
+    def _writer(self, proc):
+        from array import array
+        while self.proc is proc:
+            with self.cv:
+                while not self.queue and self.proc is proc: self.cv.wait(0.5)
+                if self.proc is not proc: return
+                pcm = self.queue.popleft()
+            if self.gain != 1.0:
+                a = array("h"); a.frombytes(pcm[: len(pcm) // 2 * 2])
+                if sys.byteorder == "big": a.byteswap()
+                g = self.gain
+                a = array("h", (max(-32768, min(32767, int(v * g))) for v in a))
+                if sys.byteorder == "big": a.byteswap()
+                pcm = a.tobytes()
+            try:
+                proc.stdin.write(pcm); proc.stdin.flush()
+            except (OSError, ValueError):
+                return
 
 
 class KnownCameras:
@@ -420,6 +562,8 @@ class CameraManager:
         self.restarts = {}              # devid -> reconnect count
         self.seen = {}                  # devid -> (ip, time) of the last LAN-search answer (any camera, also removed ones)
         self.busy = set()               # devids currently being configured (watchdog leaves them alone)
+        self.player = AudioPlayer()
+        self.audio_devid = None         # the camera whose sound is playing (one at a time, like the app)
         self.lock = threading.Lock()
         self.lan_lock = threading.Lock()  # one user of the LAN-search reply port (2726) at a time
         self.running = True
@@ -437,6 +581,7 @@ class CameraManager:
 
     def stop(self):
         self.running = False
+        self.player.stop()
         with self.hub.lock:
             for c in self.hub.cams.values():
                 try: c.stop()
@@ -512,10 +657,50 @@ class CameraManager:
         with self.lock: self.info.setdefault(ip, {"devid": ip})
         self._open_async(ip)
 
+    # -- sound
+    def audio_codec(self, devid):
+        """'PCM', 'G711', 'G726', ... (cameras whose type is not known yet are assumed to send PCM)"""
+        t = str(self.info.get(devid, {}).get("userType", ""))
+        return AUDIO_CODECS.get(t, "PCM" if not t else "G729")
+
+    def audio_supported(self, devid):
+        """(ok, reason)"""
+        if not self.player.available(): return False, "no sound player found (pacat, pw-cat or aplay)"
+        codec = self.audio_codec(devid)
+        if codec == "G711" and not _HAVE_AUDIOOP: return False, "G.711 needs the audioop module (Python ≤ 3.12)"
+        if codec not in ("PCM", "G711"): return False, f"the camera's {codec} audio is not supported yet"
+        return True, ""
+
+    def set_audio(self, devid, on):
+        """start/stop the camera's microphone sound; only one camera plays at a time"""
+        prev = self.audio_devid
+        if prev and (prev != devid or not on):
+            self.audio_devid = None
+            c = self.cam(prev)
+            if c:
+                with self.hub.lock: c.want_audio = False; c.on_audio = None; c.stop_audio()
+            self.player.stop()
+        if on:
+            self.audio_devid = devid
+            self.player.start()
+            c = self.cam(devid)
+            if c:
+                with self.hub.lock:
+                    c.want_audio = True; c.on_audio = self._audio_in; c.audio_tries = 0
+                    if c.started and not c.audio_started: c.request_audio()
+
+    def _audio_in(self, devid, body):
+        if devid != self.audio_devid: return
+        if self.audio_codec(devid) == "G711":
+            body = audioop.alaw2lin(body, 2)
+        self.player.feed(body)
+
     # -- camera lifecycle
     def _open(self, ip, devid):
         c = Cam(self.hub, ip, devid)
-        c.open()                                    # hello + HK_RES_REQ (sends only, safe outside the lock)
+        if devid == self.audio_devid:               # keep the sound on across reconnects / settings changes
+            c.want_audio = True; c.on_audio = self._audio_in
+        c.open()                                   # hello + HK_RES_REQ (sends only, safe outside the lock)
         with self.hub.lock:
             old = self.hub.cams.get(ip)
             self.hub.cams[ip] = c
@@ -1006,13 +1191,23 @@ class CameraWindow(QWidget):
         full = QPushButton("Fullscreen (F11)"); full.clicked.connect(self.toggle_fullscreen)
         sett = QPushButton("Settings…"); sett.clicked.connect(self.open_settings)
         wifi = QPushButton("WiFi…"); wifi.clicked.connect(lambda: WifiDialog(self.mgr, self.state.devid, self).exec())
+        self.sound = QPushButton("Sound (M)"); self.sound.setCheckable(True); self.sound.setObjectName("sound")
+        self.sound.toggled.connect(self.toggle_sound)
+        self.volume = QSlider(Qt.Orientation.Horizontal); self.volume.setRange(0, 400); self.volume.setFixedWidth(90)
+        self.volume.setValue(int(mgr.player.gain * 100)); self.volume.valueChanged.connect(self.set_volume)
+        self.volume.setToolTip(f"volume {self.volume.value()} %")
+        ok, why = mgr.audio_supported(devid)
+        if not ok:
+            self.sound.setEnabled(False); self.volume.setEnabled(False); self.sound.setToolTip(why)
         self.bar = QWidget(); bl = QHBoxLayout(self.bar); bl.setContentsMargins(8, 6, 8, 6)
-        bl.addWidget(self.stats); bl.addStretch(); bl.addWidget(sett); bl.addWidget(wifi); bl.addWidget(self.rec); bl.addWidget(snap); bl.addWidget(full)
+        bl.addWidget(self.stats); bl.addStretch(); bl.addWidget(self.sound); bl.addWidget(self.volume)
+        bl.addWidget(sett); bl.addWidget(wifi); bl.addWidget(self.rec); bl.addWidget(snap); bl.addWidget(full)
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
         lay.addWidget(self.view, 1); lay.addWidget(self.bar)
         QShortcut(QKeySequence("F11"), self, self.toggle_fullscreen)
         QShortcut(QKeySequence("S"), self, self.snapshot)
         QShortcut(QKeySequence("Escape"), self, self.escape)
+        QShortcut(QKeySequence("M"), self, lambda: self.sound.isEnabled() and self.sound.toggle())
         self.rec_dir = None
 
     def refresh(self):
@@ -1028,7 +1223,17 @@ class CameraWindow(QWidget):
         parts.append(f"frames {c.nframes}  dropped {c.lost}")
         if self.mgr.restarts.get(self.state.devid): parts.append(f"reconnects {self.mgr.restarts[self.state.devid]}")
         if self.rec_dir: parts.append("● REC")
+        playing = self.mgr.audio_devid == self.state.devid
+        if self.sound.isChecked() != playing:                # another window took the sound over
+            self.sound.blockSignals(True); self.sound.setChecked(playing); self.sound.blockSignals(False)
+        if playing: parts.append("♪ sound" if c.audio_started else "♪ connecting…")
         self.stats.setText("   ".join(parts))
+
+    def toggle_sound(self, on):
+        self.mgr.set_audio(self.state.devid, on)
+
+    def set_volume(self, v):
+        self.mgr.player.gain = v / 100; self.volume.setToolTip(f"volume {v} %")
 
     def snapshot(self):
         c = self.state.cam
@@ -1064,6 +1269,7 @@ class CameraWindow(QWidget):
 
     def closeEvent(self, e):
         if self.rec_dir: self.record(False)
+        if self.mgr.audio_devid == self.state.devid: self.mgr.set_audio(self.state.devid, False)
         self.on_close(self.state.devid); super().closeEvent(e)
 
 
@@ -1311,6 +1517,7 @@ QToolBar { border: none; border-bottom: 1px solid #333; spacing: 6px; padding: 4
 QPushButton, QToolButton { background: #2a2a2a; border: 1px solid #444; border-radius: 4px; padding: 5px 12px; }
 QPushButton:hover, QToolButton:hover { border-color: #8ab4f8; }
 QPushButton:checked { background: #7a1f1f; }
+QPushButton#sound:checked { background: #1f5c34; border-color: #3c9a5f; }
 QStatusBar { color: #999; border-top: 1px solid #333; }
 QTableWidget { gridline-color: #2a2a2a; selection-background-color: #2b3f5c; }
 QHeaderView::section { background: #1b1b1b; color: #aaa; border: none; border-bottom: 1px solid #333; padding: 4px; }
