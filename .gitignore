@@ -1,0 +1,21 @@
+__pycache__/
+frames/
+.claude/
+
+# captures contain network traffic and WiFi credentials
+*.pcap
+*.pcapng
+
+# third-party binaries and decompiled code
+*.apk
+*.exe
+*.zip
+Android/
+
+# local tools kept out of the repo (camb_gui.py is self-contained)
+camb.py
+camb[2-6].py
+camb_bridge*.py
+camb_decode*.py
+wifi_monitor.py
+wifi_NOmonitor.py

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-camb_gui.py - desktop viewer for "Plug2View"/HK-family mini cameras (uses the protocol code in camb6.py).
+camb_gui.py - desktop viewer for "Plug2View"/HK-family mini cameras (self-contained, no app, no cloud).
 
   python3 camb_gui.py                         discover cameras on the LAN and show them all
   python3 camb_gui.py --cams 192.168.1.50     also add cameras by IP (comma separated)
@@ -12,8 +12,8 @@ Toolbar "Camera list": switch cameras on/off, rename, remove/restore, add by IP,
 Camera window: Settings… (video quality) and WiFi… (join the camera to a network; it restarts).
 Click a tile to open that camera in its own window (double-click / F11 = fullscreen, S = snapshot, Esc = close).
 """
-import argparse, json, os, re, sys, threading, time
-from collections import deque
+import argparse, json, os, random, re, select, socket, string, sys, threading, time
+from collections import OrderedDict, deque
 
 try:
     from PyQt6.QtCore import Qt, QTimer, QRectF, QObject, pyqtSignal
@@ -32,8 +32,294 @@ except ImportError:
                                  QLineEdit, QCheckBox, QMessageBox, QDockWidget, QTableWidget,
                                  QTableWidgetItem, QHeaderView, QAbstractItemView, QInputDialog)
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import camb6 as camb
+# ------------------------------------------------------------------ camera protocol (from camb6.py)
+# UDP 5000 <-> 5000, LAN search on UDP 2627; see README.md for the packet formats
+XOR = 0xE9
+CLIENT_TAG = b"\xd1\x07"
+PORT = 5000
+# 13-byte hello: 00 00 d0 00 [type|2] [conn-id] [hi|conn-lo] 09 00 d1 07 00 00
+# the app picks a new connection id each start (seen: 9e/7 and cd/3); reusing an old one makes the
+# camera treat us as the previous connection and ignore our fresh sequence numbers.
+def hello_pkt(kind, cid, lo):
+    t, hi = {"open1": (0x82, 0x00), "open2": (0xA2, 0x30), "keep": (0x62, 0x70)}[kind]
+    return bytes([0, 0, 0xD0, 0, t, cid, hi | lo, 0x09, 0, 0xD1, 0x07, 0, 0])
+
+def new_conn():
+    return random.randrange(1, 255), random.randrange(0, 16)
+SECRET_KEYS = ("wifipassword", "Psw", "pswd", "password")
+
+# ------------------------------------------------------------------ codec
+def benc(d):
+    out = b"d"
+    for k, v in d.items():
+        k, v = k.encode(), str(v).encode()
+        out += b"%d:%s%d:%s" % (len(k), k, len(v), v)
+    return out + b"e"
+
+def bdec(b):
+    res, i = OrderedDict(), 1 if b[:1] == b"d" else 0
+    try:
+        while i < len(b) and b[i:i+1] not in (b"e", b"\0"):
+            vals = []
+            for _ in range(2):
+                m = re.match(rb"(\d+):", b[i:]); n = int(m.group(1)); i += len(m.group(0))
+                vals.append(b[i:i+n].decode("latin-1")); i += n
+            res[vals[0]] = vals[1]
+    except Exception:
+        res["_raw"] = b.decode("latin-1")
+    return res
+
+def build_ctl(d, n, b45=None):
+    body = bytes(c ^ XOR for c in benc(d) + b"\0")
+    total = 13 + len(body)
+    b4, b5 = b45 or (0x10 | (n & 3), 0x29)
+    return (b"\0\0" + (total << 4).to_bytes(2, "little") + bytes([b4, b5, 0]) +
+            (total - 4).to_bytes(2, "little") + CLIENT_TAG + b"\0\0" + body)
+
+def parse_ctl(pl):
+    return bdec(bytes(c ^ XOR for c in pl[13:]))
+
+def build_data(seq, text, code):
+    t = text.encode("latin-1")
+    body = t[:2] + bytes(c ^ XOR for c in t[2:])
+    total = 13 + len(body)
+    return (seq.to_bytes(2, "little") + (total << 4).to_bytes(2, "little") + b"\x32\x01\x00" +
+            (total - 4).to_bytes(2, "little") + code.to_bytes(2, "little") + b"\0\0" + body)
+
+def data_text(pl):
+    t = pl[13:]
+    return (t[:2] + bytes(c ^ XOR for c in t[2:])).decode("latin-1", "replace")
+
+def kv(text):
+    out = OrderedDict()
+    for part in text.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k] = bdec(v.encode("latin-1")) if v.startswith("d") and v.endswith("e") and ":" in v else v
+    return out
+
+def lan_text(pl):
+    raw = pl[13:].rstrip(b"\0")
+    cands = [raw, bytes(c ^ XOR for c in raw), raw[:2] + bytes(c ^ XOR for c in raw[2:])]
+    return max(cands, key=lambda b: b.count(b"=") + 10 * (b"MainCmd" in b)).decode("latin-1")
+
+def mask(d, show=False):
+    if show: return d
+    out = OrderedDict()
+    for k, v in d.items():
+        out[k] = mask(v) if isinstance(v, dict) else ("***" if k in SECRET_KEYS and v else v)
+    return out
+
+def jpeg_size(j):
+    """(width, height) from the SOF marker, without PIL"""
+    i = 2
+    while i + 9 < len(j):
+        if j[i] != 0xFF: i += 1; continue
+        m = j[i+1]
+        if m in (0xC0, 0xC1, 0xC2): return int.from_bytes(j[i+7:i+9], "big"), int.from_bytes(j[i+5:i+7], "big")
+        if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7: i += 2; continue
+        i += 2 + int.from_bytes(j[i+2:i+4], "big")
+    return None
+
+def rnd(n): return "".join(random.choice(string.ascii_letters + string.digits) for _ in range(n))
+
+def discovery_packet():
+    end = int(time.time()) + 3600
+    return bytes.fromhex("0000E007B2855A7A0000000000") + (
+        f"TIME=3600;endTime={end};MainCmd=LocalData;userType=hkclient;"
+        f"status=1;Prot=5000;MacIP=0x0xedabddb0:977017447;").encode()
+
+def mksock(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.bind(("", port)); return s
+
+# ------------------------------------------------------------------ discovery
+def discover(targets=("255.255.255.255",), wait=3.0):
+    """returns {ip: info-dict} from the LAN-search replies"""
+    s = mksock(2726)
+    for t in targets:
+        try: s.sendto(discovery_packet(), (t, 2627))
+        except OSError as e: print(f"send to {t}: {e}")
+    found, end = {}, time.time() + wait
+    while time.time() < end:
+        r, _, _ = select.select([s], [], [], 0.2)
+        if not r: continue
+        pl, addr = s.recvfrom(4096)
+        if pl[:2] != b"\0\0" or len(pl) < 20: continue
+        info = kv(lan_text(pl))
+        if info.get("MainCmd") == "LocalData" and "devid" in info:
+            found[addr[0]] = info
+    s.close()
+    return found
+
+def bcast_targets(extra):
+    t = ["255.255.255.255"] + [x for x in (extra or "").split(",") if x]
+    return t
+
+# ------------------------------------------------------------------ one camera
+class Frames:
+    def __init__(self): self.cv = threading.Condition(); self.jpg = None; self.count = 0
+    def put(self, j):
+        with self.cv: self.jpg = j; self.count += 1; self.cv.notify_all()
+
+class Cam:
+    def __init__(self, hub, ip, devid=None, save=None):
+        self.hub, self.ip, self.devid, self.save = hub, ip, devid or ip, save
+        self.frames = Frames(); self.n = 0; self.tx = 1
+        self.pkts = {}; self.nxt = None; self.ack = None
+        self.buf = bytearray(); self.in_frame = False
+        self.nframes = 0; self.lost = 0; self.last_rx = 0; self.gap_since = None
+        self.sid = None; self.sids = set(); self.started = False; self.req_at = 0; self.retries = 0
+        self.verbose = False
+        self.guard = 0; self.next_guard = 0; self.next_hello = 0
+        self.cid, self.clo = new_conn(); self.hello_reply = None
+        self.replies = []          # text replies (config mode)
+        self.acked = set()         # our data seqs the camera acknowledged
+        if save: os.makedirs(save, exist_ok=True)
+
+    # -- send helpers
+    def send_raw(self, b): self.hub.sock.sendto(b, (self.ip, PORT))
+    def send_ctl(self, d, b45=None): self.n += 1; self.send_raw(build_ctl(d, self.n, b45))
+    def send_data(self, text, code):
+        seq = self.tx; self.send_raw(build_data(seq, text, code)); self.tx = (self.tx + 1) & 0xFFFF; return seq
+    def hello(self, new=False):
+        if new:
+            self.cid, self.clo = new_conn(); self.tx = 1          # fresh connection, sequence restarts
+        self.send_raw(hello_pkt("open1", self.cid, self.clo)); self.send_raw(hello_pkt("open2", self.cid, self.clo))
+
+    # -- video session
+    def request(self):
+        self.sid = f"{rnd(5)}.{random.getrandbits(32):08x}"; self.sids.add(self.sid)
+        self.send_data(f"id=11;ftN0=video.vbVideo.MPEG4;ftN1=net.0;ftN2=HKPCPresent.HKPCPresent;"
+                       f"opN2={self.sid};Callid={rnd(24)}{random.getrandbits(32):08x};sidN={self.sid};"
+                       f"AsCode=337;MainCmd=HK_RES_REQ;user=Lan user;", 337)
+        self.req_at = time.time()
+
+    def start_session(self, fd):
+        self.send_data(f"MainCmd=SessionStart;sidN={self.sid};ftN0=HKPCPresent.HKPCPresent;"
+                       f"FD0=9;ftN1=net.{fd};FD1={fd};", 100)
+        self.started = True
+        print(f"[{self.devid}] session started")
+
+    def stop(self):
+        if self.sid: self.send_data(f"sidN={self.sid};MainCmd=SessionDelete;coz=;", 100)
+
+    def open(self):
+        self.hello(); time.sleep(0.3); self.request()
+        self.send_ctl(OrderedDict(ICMD=29, SEQ=1, GUARDSEQ=0), b45=(0x10, 0x00))
+
+    def tick(self, now):
+        if self.sid and not self.started and now - self.req_at > 3:
+            self.retries += 1
+            if self.retries % 3 == 0:          # only every 3rd retry starts a new connection
+                print(f"[{self.devid}] no SessionCreate yet, new connection id")
+                self.hello(new=True); time.sleep(0.3)
+            else:
+                print(f"[{self.devid}] no SessionCreate yet, asking again")
+            self.request()
+        if now >= self.next_guard:
+            self.guard += 1; self.send_ctl(OrderedDict(ICMD=29, SEQ=self.guard + 1, GUARDSEQ=self.guard), b45=(0x10, 0x00))
+            self.next_guard = now + 1.5
+        if now >= self.next_hello:
+            self.send_raw(hello_pkt("keep", self.cid, self.clo)); self.next_hello = now + 10
+        self.consume()
+
+    # -- receive
+    def on_packet(self, pl):
+        if pl[:2] == b"\0\0":
+            if len(pl) == 13:
+                self.hello_reply = pl; return
+            if len(pl) > 13:
+                d = parse_ctl(pl)
+                if d.get("ICMD") == "1" and "SEQ" in d: self.acked.add(int(d["SEQ"]))
+            return
+        seq = int.from_bytes(pl[0:2], "little")
+        self.last_rx = time.time()
+        if self.verbose and not self.started:
+            print(f"[{self.devid}] << data seq={seq} {len(pl)}B {pl[:16].hex(' ')}")
+        if b"\xff\xd8" not in pl:
+            t = data_text(pl)
+            d = None
+            if "MainCmd=" in t:
+                d = kv(t)
+            elif re.match(r"d\d+:", t):                     # bencode reply (e.g. answer to MainCmd=800)
+                b = bdec(t.rstrip("\0").encode("latin-1"))
+                if "_raw" not in b: d = b
+            if d is not None:
+                self.replies.append(d)
+                self.send_ctl(OrderedDict(ICMD=1, SEQ=seq, TIME=0))      # ack replies right away
+                if d.get("MainCmd") == "SessionCreate" and not self.started and d.get("sidN") in self.sids:
+                    self.sid = d["sidN"]; self.start_session(d.get("FD0", "1025"))
+                elif d.get("MainCmd") != "SessionCreate" or self.verbose:
+                    print(f"[{self.devid}] << {dict(mask(d))}")
+                if not self.started: return
+        if not self.started: return
+        if self.nxt is None: self.nxt = seq; self.ack = seq
+        if ((seq - self.nxt) & 0xFFFF) > 0x8000: return
+        self.pkts[seq] = pl[4:]
+        self.consume()
+        while all(((self.ack + k) & 0xFFFF) in self.pkts or ((self.ack + k - self.nxt) & 0xFFFF) > 0x8000
+                  for k in range(5)):
+            self.send_ctl(OrderedDict(ICMD=1, SEQ=self.ack, TIME=0))
+            self.ack = (self.ack + 5) & 0xFFFF
+
+    def consume(self):
+        while self.nxt is not None:
+            if self.nxt in self.pkts:
+                self.feed(self.pkts.pop(self.nxt)); self.nxt = (self.nxt + 1) & 0xFFFF; self.gap_since = None
+                continue
+            if not self.pkts: return
+            ahead = max(((s - self.nxt) & 0xFFFF) for s in self.pkts)
+            if self.gap_since is None:
+                self.gap_since = time.time(); self.request_resend(ahead)
+            if ahead > 30 or time.time() - self.gap_since > 0.3:
+                self.lost += 1; self.in_frame = False; self.buf.clear()
+                self.nxt = (self.nxt + 1) & 0xFFFF; self.gap_since = None
+                continue
+            return
+
+    def request_resend(self, ahead):
+        missing = [(self.nxt + k) & 0xFFFF for k in range(min(ahead, 31)) if ((self.nxt + k) & 0xFFFF) not in self.pkts]
+        if not missing: return
+        d = OrderedDict(ICMD=1, SEQ=self.ack, TIME=0, Flag=1)
+        for i, m in enumerate(missing): d[f"LostSEQ_{i}"] = m
+        d["Count"] = len(missing); self.send_ctl(d)
+
+    def feed(self, data):
+        a = data.find(b"\xff\xd8\xff")
+        if a >= 0: self.buf = bytearray(data[a:]); self.in_frame = True
+        elif self.in_frame: self.buf += data
+        if self.in_frame:
+            e = self.buf.find(b"\xff\xd9")
+            if e >= 0:
+                jpg = bytes(self.buf[:e+2]); self.in_frame = False; self.buf.clear()
+                self.nframes += 1; self.frames.put(jpg)
+                if self.save:
+                    with open(os.path.join(self.save, f"{self.devid}_{self.nframes:06d}.jpg"), "wb") as f: f.write(jpg)
+
+# ------------------------------------------------------------------ hub (one UDP socket, many cameras)
+class Hub:
+    def __init__(self):
+        self.sock = mksock(PORT); self.cams = {}; self.lock = threading.Lock()
+    def add(self, cam): self.cams[cam.ip] = cam
+    def poll(self, timeout=0.2):
+        r, _, _ = select.select([self.sock], [], [], timeout)
+        if r:
+            pl, addr = self.sock.recvfrom(65535)
+            cam = self.cams.get(addr[0])
+            if cam:
+                with self.lock: cam.on_packet(pl)
+        now = time.time()
+        with self.lock:
+            for c in self.cams.values(): c.tick(now) if c.sid else None
+    def wait_for(self, cond, timeout):
+        end = time.time() + timeout
+        while time.time() < end:
+            self.poll(0.1)
+            if cond(): return True
+        return False
 
 STALL_SECS = 8          # no data for this long while streaming -> reconnect
 CONNECT_SECS = 25       # no session after this long -> start over with a fresh Cam
@@ -52,11 +338,11 @@ def lan_benc(fields):
 def parse_lan_reply(pl):
     """a LAN-port reply as dict: bencode or key=value text, plain or XOR 0xE9"""
     body = pl[13:].rstrip(b"\0")
-    for b in (body, bytes(c ^ camb.XOR for c in body)):
+    for b in (body, bytes(c ^ XOR for c in body)):
         if b[:1] == b"d" and re.match(rb"d\d+:", b):
-            d = camb.bdec(b)
+            d = bdec(b)
             if "_raw" not in d: return d
-    d = camb.kv(camb.lan_text(pl))
+    d = kv(lan_text(pl))
     return d or None
 
 
@@ -125,7 +411,7 @@ class KnownCameras:
 class CameraManager:
     """owns the UDP hub, keeps every known camera streaming, finds new ones periodically"""
     def __init__(self, extra_ips=(), bcast=None, scan_every=15.0, known=None):
-        self.hub = camb.Hub()
+        self.hub = Hub()
         self.known = known if known is not None else KnownCameras()
         self.extra_ips, self.bcast, self.scan_every = list(extra_ips), bcast, scan_every
         self.by_devid = {}              # devid -> Cam (the Cam object is replaced on reconnect)
@@ -211,7 +497,7 @@ class CameraManager:
 
     def add_ip(self, ip):
         """add a camera by address (blocking); returns its devid, or None if it did not answer"""
-        with self.lan_lock: found = camb.discover([ip], wait=2.0)
+        with self.lan_lock: found = discover([ip], wait=2.0)
         info = found.get(ip)
         if info and "devid" in info:
             devid = info["devid"]
@@ -228,7 +514,7 @@ class CameraManager:
 
     # -- camera lifecycle
     def _open(self, ip, devid):
-        c = camb.Cam(self.hub, ip, devid)
+        c = Cam(self.hub, ip, devid)
         c.open()                                    # hello + HK_RES_REQ (sends only, safe outside the lock)
         with self.hub.lock:
             old = self.hub.cams.get(ip)
@@ -269,12 +555,12 @@ class CameraManager:
                bytes([flag]) + b"\x64\0\0\0")
         replies = []
         with self.lan_lock:                         # discovery uses the same reply port (2726)
-            s = camb.mksock(2726)
+            s = mksock(2726)
             try:
                 s.sendto(hdr + body, (ip, 2627))
                 end = time.time() + wait
                 while time.time() < end:
-                    r, _, _ = camb.select.select([s], [], [], 0.2)
+                    r, _, _ = select.select([s], [], [], 0.2)
                     if not r: continue
                     pl, addr = s.recvfrom(65535)
                     if addr[0] == ip and pl[:2] == b"\0\0" and len(pl) > 13:
@@ -321,7 +607,7 @@ class CameraManager:
     def _command(self, ip, devid, text):
         """send one command on a fresh connection; returns (acknowledged, [reply dicts])"""
         for attempt in range(3):
-            c = camb.Cam(self.hub, ip, devid)
+            c = Cam(self.hub, ip, devid)
             with self.hub.lock: self.hub.cams[ip] = c
             c.hello(new=True)
             if not self._wait(lambda: c.hello_reply is not None, 1.5): continue
@@ -391,9 +677,9 @@ class CameraManager:
                 self.scanning = True
                 try:
                     saved = [k["ip"] for _, k in self.known.items()]
-                    targets = list(dict.fromkeys(self.extra_ips + saved + camb.bcast_targets(self.bcast)))
+                    targets = list(dict.fromkeys(self.extra_ips + saved + bcast_targets(self.bcast)))
                     with self.lan_lock:
-                        found = camb.discover(targets, wait=2.0)   # saved IPs are asked directly too
+                        found = discover(targets, wait=2.0)   # saved IPs are asked directly too
                     for ip in self.extra_ips:              # manual IPs are shown even if they stay silent
                         if ip not in found and not any(c.ip == ip for c in list(self.by_devid.values())):
                             found[ip] = {"devid": ip, "_manual": True}
@@ -700,7 +986,7 @@ class WifiDialog(QDialog):
         self.apply_btn.setEnabled(True)
         if replies is None:
             self.status.setText("Camera not connected."); return
-        extra = f" Camera answered: {dict(camb.mask(replies[0]))}" if replies else ""
+        extra = f" Camera answered: {dict(mask(replies[0]))}" if replies else ""
         self.status.setText(f"Sent. The camera is restarting and will join \"{ssid}\". If this computer is on that "
                             "network too, the camera reappears here by itself after the next scan." + extra)
 
@@ -734,7 +1020,7 @@ class CameraWindow(QWidget):
         c = self.state.cam
         if not c: self.stats.setText("not connected"); return
         if self.rec_dir and c.save != self.rec_dir: c.save = self.rec_dir   # keep recording across reconnects
-        j = c.frames.jpg; size = camb.jpeg_size(j) if j else None
+        j = c.frames.jpg; size = jpeg_size(j) if j else None
         parts = [c.ip]
         if size: parts.append(f"{size[0]}×{size[1]}")
         if c.started: parts.append(f"{self.state.fps():.1f} fps")
@@ -1037,9 +1323,9 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { color: #555; border-
 
 # ------------------------------------------------------------------ main
 def port_free(port):
-    """camb6 binds with SO_REUSEADDR, so a second instance would bind silently and split the camera traffic;
+    """mksock binds with SO_REUSEADDR, so a second instance would bind silently and split the camera traffic;
     a bind without the flag fails while anyone holds the port"""
-    t = camb.socket.socket(camb.socket.AF_INET, camb.socket.SOCK_DGRAM)
+    t = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         t.bind(("", port)); return True
     except OSError:
@@ -1056,14 +1342,14 @@ def main():
     a = ap.parse_args()
 
     app = QApplication(sys.argv[:1]); app.setApplicationName("Cameras"); app.setStyleSheet(STYLE)
-    if not port_free(camb.PORT):
-        msg = (f"UDP port {camb.PORT} is already in use - another camb_gui.py or camb6.py serve is running.\n"
+    if not port_free(PORT):
+        msg = (f"UDP port {PORT} is already in use - another camb_gui.py or camb6.py serve is running.\n"
                "Two programs on this port steal each other's camera packets; close the other one first.")
         QMessageBox.critical(None, "Cameras", msg); sys.exit(msg)
     try:
         mgr = CameraManager([x for x in (a.cams or "").split(",") if x], a.bcast, a.scan)
     except OSError as e:
-        sys.exit(f"cannot open UDP port {camb.PORT} ({e}) - is camb6.py serve still running?")
+        sys.exit(f"cannot open UDP port {PORT} ({e}) - is another camera program still running?")
     mgr.start()
     win = MainWindow(mgr); win.show()
     try:
