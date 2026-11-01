@@ -333,14 +333,16 @@ class Cam:
 
     def feed(self, ch, data):
         if self.is_frame_header(data):
+            if not self.framed: self.in_frame = False; self.buf.clear()   # framed camera: drop marker-search state
             self.framed.add(ch)                          # a cut-off frame before this one is dropped
             self.chan[ch] = [bytearray(data), int.from_bytes(data[3:5], "little")]
         elif ch in self.chan:
             self.chan[ch][0] += data
-        elif ch not in self.framed:
-            return self.feed_markers(data)               # stream without frame headers: find JPEGs by marker
+        elif not self.framed:
+            return self.feed_markers(data)               # camera without frame headers: find JPEGs by marker
         else:
-            return                                       # rest of a frame whose start was lost
+            return                                       # rest of a frame whose start was lost (or audio
+                                                         # joined mid-frame; its samples can look like JPEG markers)
         buf, need = self.chan[ch]
         if len(buf) >= need:
             del self.chan[ch]
@@ -357,7 +359,11 @@ class Cam:
             e = body.rfind(b"\xff\xd9")
             if e > a: self.got_jpeg(body[a:e + 2])
 
+    JPEG_FIRST_MARKERS = {0xDB, 0xC0, 0xC2, 0xC4, 0xDD, 0xFE} | set(range(0xE0, 0xF0))
+
     def got_jpeg(self, jpg):
+        if len(jpg) < 64 or jpg[3] not in self.JPEG_FIRST_MARKERS or not jpeg_size(jpg):
+            return                                       # not a real JPEG (e.g. audio bytes that look like markers)
         self.nframes += 1; self.frames.put(jpg)
         if self.save:
             with open(os.path.join(self.save, f"{self.devid}_{self.nframes:06d}.jpg"), "wb") as f: f.write(jpg)
